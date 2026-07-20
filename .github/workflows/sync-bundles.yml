@@ -92,34 +92,51 @@ jobs:
         if: steps.version_check.outputs.already_synced != 'true'
         run: python3 scripts/sync_bundles.py
 
-      # ── Commit + push ────────────────────────────────────────────────────────
+      # ── Commit + push in batches of 50 ──────────────────────────────────────
       - name: Commit and push new bundles
         if: steps.version_check.outputs.already_synced != 'true'
         run: |
           VERSION="${{ steps.version_check.outputs.version }}"
           PLATFORM="${{ env.SFA_PLATFORM }}"
+          BATCH_SIZE=50
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Stage everything under bundles/
-          git add bundles/
+          # Collect all untracked / modified files under bundles/
+          mapfile -t NEW_FILES < <(git ls-files --others --modified --exclude-standard bundles/)
 
-          # Check if there's actually anything new
-          if git diff --cached --quiet; then
+          TOTAL=${#NEW_FILES[@]}
+          if [ "$TOTAL" -eq 0 ]; then
             echo "No new files to commit."
             exit 0
           fi
+          echo "Total new files: $TOTAL — pushing in batches of $BATCH_SIZE"
 
-          ADDED=$(git diff --cached --name-only | wc -l)
-          git commit -m "sync: ${VERSION} [${PLATFORM}] — ${ADDED} files"
+          push_with_retry() {
+            for attempt in 1 2 3; do
+              git pull --rebase origin main && git push origin main && return 0
+              echo "  Push attempt $attempt failed, retrying in 15s…"
+              sleep 15
+            done
+            echo "ERROR: push failed after 3 attempts" >&2
+            return 1
+          }
 
-          # Push with retry in case of concurrent runs
-          for attempt in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            echo "Push attempt $attempt failed, retrying…"
-            sleep 10
+          BATCH_NUM=0
+          for (( i=0; i<TOTAL; i+=BATCH_SIZE )); do
+            BATCH_NUM=$(( BATCH_NUM + 1 ))
+            CHUNK=("${NEW_FILES[@]:$i:$BATCH_SIZE}")
+            COUNT=${#CHUNK[@]}
+
+            git add "${CHUNK[@]}"
+            git commit -m "sync: ${VERSION} [${PLATFORM}] batch ${BATCH_NUM} (${COUNT} files, $(( i + COUNT ))/${TOTAL} total)"
+
+            echo "Pushing batch ${BATCH_NUM} (${COUNT} files)…"
+            push_with_retry || exit 1
           done
+
+          echo "All $TOTAL files committed and pushed in $BATCH_NUM batches."
 
       # ── Summary ──────────────────────────────────────────────────────────────
       - name: Summary
