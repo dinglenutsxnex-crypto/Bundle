@@ -3,36 +3,35 @@ sync_bundles.py
 ===============
 Fetches the latest Shadow Fight Arena config archive, decrypts it, reads
 bundlesConfig to get all asset bundle paths, then downloads every .bin bundle
-from the CDN and saves them under bundles/{version}/.
+from the CDN and commits them directly to GitHub via the Git Data API.
 
-Run by the GitHub Actions workflow.  Also runnable locally:
-    python3 scripts/sync_bundles.py
+No local git repo operations — files live only in memory (or /tmp briefly),
+so runner disk space is never an issue.
 
-Env vars the workflow injects (all optional when running locally):
+Required env vars (injected by the workflow):
+    GITHUB_TOKEN   – repo write token
+    GITHUB_REPO    – owner/repo  (default: dinglenutsxnex-crypto/Bundle)
+    GITHUB_BRANCH  – branch to commit to (default: main)
+
+Optional:
     SFA_PLATFORM   – Android (default) | iOS | StandaloneWindows
-    OUT_DIR        – where to write bundles (default: bundles)
-
-Output layout:
-    bundles/
-      {version}/           e.g. 1.9.80.20.26181-prod
-        000d4845...bin
-        001b2a93...bin
-        ...
-      latest.txt           → current version string
+    BATCH_SIZE     – files per commit  (default: 250)
+    WORKERS        – parallel download+upload threads (default: 16)
+    FORCE_SYNC     – "true" to re-upload even if version unchanged
 """
 
+import base64
 import json
 import os
 import random
 import re
 import struct
 import sys
+import time
 import urllib.error
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -40,20 +39,19 @@ BALANCE_URL = (
     "https://sfalb.nekki.com/balance"
     "?w=PROD-AS&fv=1.9.80.20.26181-prod&rand={rand}&p=Android&client_version=1.9.81"
 )
-
-# AES-128-CBC key + IV (verified for SFA config archives)
 AES_KEY = bytes.fromhex("08050674cc9ab867197f0cad55a770ca")
 AES_IV  = bytes.fromhex("653e0715236e0f734f1ebf64228b322d")
 
-CDN_MIRRORS = [
-    "https://sfacdn.nekki.com",
-    "https://sc22o7jgey.a.trbcdn.net",
-]
-
-PLATFORM   = os.environ.get("SFA_PLATFORM", "Android")
-OUT_DIR    = Path(os.environ.get("OUT_DIR", "bundles"))
-WORKERS    = int(os.environ.get("WORKERS", "8"))
-UA         = "UnityPlayer/2022.3"
+CDN_MIRRORS  = ["https://sfacdn.nekki.com", "https://sc22o7jgey.a.trbcdn.net"]
+GITHUB_API   = "https://api.github.com"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO  = os.environ.get("GITHUB_REPO", "dinglenutsxnex-crypto/Bundle")
+GITHUB_BRANCH= os.environ.get("GITHUB_BRANCH", "main")
+PLATFORM     = os.environ.get("SFA_PLATFORM", "Android")
+BATCH_SIZE   = int(os.environ.get("BATCH_SIZE", "250"))
+WORKERS      = int(os.environ.get("WORKERS", "16"))
+FORCE_SYNC   = os.environ.get("FORCE_SYNC", "false").lower() == "true"
+UA_GAME      = "UnityPlayer/2022.3"
 
 
 # ── Pure-Python AES-128-CBC ───────────────────────────────────────────────────
@@ -78,9 +76,7 @@ def _build_aes_tables():
         0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
     ]
     SI = [0] * 256
-    for i, v in enumerate(S):
-        SI[v] = i
-
+    for i, v in enumerate(S): SI[v] = i
     def gmul(a, b):
         p = 0
         for _ in range(8):
@@ -89,8 +85,7 @@ def _build_aes_tables():
             if hi: a ^= 0x1b
             b >>= 1
         return p
-
-    m9  = [gmul(i, 9)  for i in range(256)]
+    m9  = [gmul(i,  9) for i in range(256)]
     m11 = [gmul(i, 11) for i in range(256)]
     m13 = [gmul(i, 13) for i in range(256)]
     m14 = [gmul(i, 14) for i in range(256)]
@@ -99,23 +94,18 @@ def _build_aes_tables():
 
 _S, _SI, _M9, _M11, _M13, _M14, _RCON = _build_aes_tables()
 
-
 def _sub_word(w):
     return (_S[w>>24]<<24)|(_S[(w>>16)&0xff]<<16)|(_S[(w>>8)&0xff]<<8)|_S[w&0xff]
-
 def _rot_word(w):
     return ((w<<8)|(w>>24))&0xffffffff
-
-def _key_expand(key: bytes):
+def _key_expand(key):
     w = [int.from_bytes(key[i:i+4], 'big') for i in range(0, 16, 4)]
     for i in range(4, 44):
         t = w[i-1]
-        if i % 4 == 0:
-            t = _sub_word(_rot_word(t)) ^ (_RCON[i//4-1] << 24)
+        if i % 4 == 0: t = _sub_word(_rot_word(t)) ^ (_RCON[i//4-1] << 24)
         w.append(w[i-4] ^ t)
     return [[w[r*4], w[r*4+1], w[r*4+2], w[r*4+3]] for r in range(11)]
-
-def _aes128_decrypt_block(blk: bytes, rk) -> bytes:
+def _aes128_decrypt_block(blk, rk):
     s = [[blk[r+4*c] for c in range(4)] for r in range(4)]
     for c in range(4):
         for r in range(4): s[r][c] ^= (rk[10][c] >> (24-r*8)) & 0xff
@@ -142,14 +132,11 @@ def _aes128_decrypt_block(blk: bytes, rk) -> bytes:
         for r in range(4): s[r][c] ^= (rk[0][c] >> (24-r*8)) & 0xff
     return bytes(s[r][c] for c in range(4) for r in range(4))
 
-def aes128_cbc_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
-    rk = _key_expand(key)
-    out = bytearray()
-    prev = iv
+def aes128_cbc_decrypt(data, key, iv):
+    rk = _key_expand(key); out = bytearray(); prev = iv
     for i in range(0, len(data), 16):
         blk = data[i:i+16]
-        dec = _aes128_decrypt_block(blk, rk)
-        out += bytes(a^b for a, b in zip(dec, prev))
+        out += bytes(a^b for a,b in zip(_aes128_decrypt_block(blk, rk), prev))
         prev = blk
     pad = out[-1]
     return bytes(out[:-pad]) if 1 <= pad <= 16 else bytes(out)
@@ -157,54 +144,46 @@ def aes128_cbc_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
 
 # ── Minimal ZIP reader ────────────────────────────────────────────────────────
 
-def _zip_entries(buf: bytes):
+def _zip_entries(buf):
     eocd = -1
     for i in range(len(buf) - 22, max(-1, len(buf) - 22 - 65535), -1):
-        if buf[i:i+4] == b'PK\x05\x06':
-            eocd = i; break
-    if eocd < 0:
-        raise ValueError("No EOCD record in ZIP")
+        if buf[i:i+4] == b'PK\x05\x06': eocd = i; break
+    if eocd < 0: raise ValueError("No EOCD in ZIP")
     cd_off = struct.unpack_from('<I', buf, eocd+16)[0]
     num    = struct.unpack_from('<H', buf, eocd+10)[0]
-    entries = []
-    pos = cd_off
+    entries = []; pos = cd_off
     for _ in range(num):
         if buf[pos:pos+4] != b'PK\x01\x02': break
         comp   = struct.unpack_from('<H', buf, pos+10)[0]
         csz    = struct.unpack_from('<I', buf, pos+20)[0]
-        usz    = struct.unpack_from('<I', buf, pos+24)[0]
         fn_len = struct.unpack_from('<H', buf, pos+28)[0]
         ex_len = struct.unpack_from('<H', buf, pos+30)[0]
         cm_len = struct.unpack_from('<H', buf, pos+32)[0]
         lh_off = struct.unpack_from('<I', buf, pos+42)[0]
         name   = buf[pos+46:pos+46+fn_len].decode(errors='replace')
-        entries.append((name, comp, csz, usz, lh_off))
+        entries.append((name, comp, csz, lh_off))
         pos += 46 + fn_len + ex_len + cm_len
     return entries
 
-def _extract_entry(buf: bytes, entry) -> bytes:
-    name, comp, csz, usz, lh_off = entry
+def _extract_entry(buf, entry):
+    name, comp, csz, lh_off = entry
     fn_len = struct.unpack_from('<H', buf, lh_off+26)[0]
     ex_len = struct.unpack_from('<H', buf, lh_off+28)[0]
-    data_off = lh_off + 30 + fn_len + ex_len
-    raw = buf[data_off:data_off+csz]
-    if comp == 0:
-        return raw
-    return zlib.decompress(raw, -15)
+    raw = buf[lh_off+30+fn_len+ex_len : lh_off+30+fn_len+ex_len+csz]
+    return raw if comp == 0 else zlib.decompress(raw, -15)
 
 
 # ── Protobuf bundle-name parser ───────────────────────────────────────────────
 
-def _read_varint(buf: bytes, pos: int):
-    result = 0; shift = 0
+def _read_varint(buf, pos):
+    r = 0; s = 0
     while True:
-        b = buf[pos]; pos += 1
-        result |= (b & 0x7f) << shift
+        b = buf[pos]; pos += 1; r |= (b & 0x7f) << s
         if not (b & 0x80): break
-        shift += 7
-    return result, pos
+        s += 7
+    return r, pos
 
-def _parse_proto_msg(buf: bytes, start: int, end: int):
+def _parse_proto(buf, start, end):
     fields = []; pos = start
     while pos < end:
         tag, pos = _read_varint(buf, pos)
@@ -215,96 +194,169 @@ def _parse_proto_msg(buf: bytes, start: int, end: int):
             l, pos = _read_varint(buf, pos); v = buf[pos:pos+l]
             fields.append((fn, 2, v)); pos += l
         elif wt == 5:
-            v = struct.unpack_from('<I', buf, pos)[0]
-            fields.append((fn, 5, v)); pos += 4
+            fields.append((fn, 5, struct.unpack_from('<I', buf, pos)[0])); pos += 4
         elif wt == 1:
-            v = struct.unpack_from('<Q', buf, pos)[0]
-            fields.append((fn, 1, v)); pos += 8
+            fields.append((fn, 1, struct.unpack_from('<Q', buf, pos)[0])); pos += 8
         else:
-            break  # unknown wire type — stop parsing this message
+            break
     return fields
 
-def parse_bundle_config(config_bytes: bytes, platform: str = "Android") -> tuple[set, int]:
-    """
-    Parse bundlesConfig_<N>_<Platform>.bytes protobuf.
-
-    Returns (archive_names: set[str], bundle_set_num: int).
-
-    Proto layout (inferred from wire format):
-      top-level: repeated BundleGroup (field 1, length-delimited)
-        BundleGroup.name: string (field 1)
-        BundleGroup.bundle: BundleInfo (field 2, length-delimited)
-          BundleInfo.archive: string (field 3)  ← the CDN archive name
-    """
-    top = _parse_proto_msg(config_bytes, 0, len(config_bytes))
-    archives: set[str] = set()
-    for fnum, wt, gdata in top:
-        if fnum != 1 or wt != 2:
-            continue
-        gfields = _parse_proto_msg(gdata, 0, len(gdata))
-        for gf in gfields:
-            if gf[0] != 2 or gf[1] != 2:
-                continue
-            sub = _parse_proto_msg(gf[2], 0, len(gf[2]))
-            for sf in sub:
+def parse_bundle_config(cfg_bytes):
+    archives = set()
+    for _, wt, gdata in _parse_proto(cfg_bytes, 0, len(cfg_bytes)):
+        if wt != 2: continue
+        for gf in _parse_proto(gdata, 0, len(gdata)):
+            if gf[0] != 2 or gf[1] != 2: continue
+            for sf in _parse_proto(gf[2], 0, len(gf[2])):
                 if sf[0] == 3 and sf[1] == 2:
                     name = sf[2].decode('utf-8', errors='replace').strip()
-                    if name:
-                        archives.add(name)
+                    if name: archives.add(name)
     return archives
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+# ── GitHub API ────────────────────────────────────────────────────────────────
 
-def _get(url: str, timeout: int = 30) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read()
+def _gh_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
 
-def _get_with_retry(url: str, retries: int = 3, timeout: int = 60) -> bytes:
+def _gh_get(path):
+    req = urllib.request.Request(f"{GITHUB_API}{path}", headers=_gh_headers())
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+def _gh_post(path, payload, method="POST"):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"{GITHUB_API}{path}", data=data, method=method, headers=_gh_headers()
+    )
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return json.loads(r.read())
+
+def gh_get_branch_sha():
+    return _gh_get(f"/repos/{GITHUB_REPO}/git/ref/heads/{GITHUB_BRANCH}")["object"]["sha"]
+
+def gh_get_commit_tree(commit_sha):
+    return _gh_get(f"/repos/{GITHUB_REPO}/git/commits/{commit_sha}")["tree"]["sha"]
+
+def gh_get_existing_files(version):
+    """Return set of filenames already in bundles/{version}/ (empty if path doesn't exist)."""
+    try:
+        tree = _gh_get(f"/repos/{GITHUB_REPO}/contents/bundles/{version}")
+        return {entry["name"] for entry in tree}
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return set()
+        raise
+
+def gh_upload_blob(content_bytes):
+    """Upload raw bytes as a git blob. Returns the blob SHA."""
+    result = _gh_post(f"/repos/{GITHUB_REPO}/git/blobs", {
+        "content": base64.b64encode(content_bytes).decode(),
+        "encoding": "base64",
+    })
+    return result["sha"]
+
+def gh_create_tree(base_tree_sha, entries):
+    """
+    entries: list of {"path": str, "mode": "100644", "type": "blob", "sha": str}
+    Returns new tree SHA.
+    """
+    result = _gh_post(f"/repos/{GITHUB_REPO}/git/trees", {
+        "base_tree": base_tree_sha,
+        "tree": entries,
+    })
+    return result["sha"]
+
+def gh_create_commit(tree_sha, parent_sha, message):
+    result = _gh_post(f"/repos/{GITHUB_REPO}/git/commits", {
+        "message": message,
+        "tree": tree_sha,
+        "parents": [parent_sha],
+    })
+    return result["sha"]
+
+def gh_update_ref(commit_sha):
+    _gh_post(
+        f"/repos/{GITHUB_REPO}/git/refs/heads/{GITHUB_BRANCH}",
+        {"sha": commit_sha},
+        method="PATCH",
+    )
+
+
+# ── CDN download ──────────────────────────────────────────────────────────────
+
+def _get_bytes(url, timeout=60, retries=3):
     last_err = None
-    for attempt in range(retries):
-        for mirror in CDN_MIRRORS:
-            # swap the primary CDN host for each mirror
-            candidate = url.replace(CDN_MIRRORS[0], mirror, 1)
-            try:
-                return _get(candidate, timeout)
-            except Exception as e:
-                last_err = e
-    raise RuntimeError(f"All retries failed for {url}: {last_err}")
+    for _ in range(retries):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": UA_GAME})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except Exception as e:
+            last_err = e
+            time.sleep(2)
+    raise RuntimeError(f"Download failed for {url}: {last_err}")
+
+def download_and_upload_blob(args):
+    """Worker: download one bundle from CDN, upload blob to GitHub. Returns (path, blob_sha)."""
+    archive_name, cdn_base, repo_path = args
+    url  = cdn_base + archive_name + ".bin"
+    # Try mirrors in order
+    data = None
+    for mirror in CDN_MIRRORS:
+        try:
+            data = _get_bytes(url.replace(CDN_MIRRORS[0], mirror, 1))
+            break
+        except Exception:
+            continue
+    if data is None:
+        raise RuntimeError(f"All mirrors failed for {archive_name}")
+
+    blob_sha = gh_upload_blob(data)
+    return repo_path, blob_sha
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    # ── Step 1: fetch balance → get version + config URL ─────────────────────
+    if not GITHUB_TOKEN:
+        sys.exit("ERROR: GITHUB_TOKEN env var is not set")
+
+    # 1. Balance → version
     rand = random.randint(10000, 99999)
-    bal_url = BALANCE_URL.format(rand=rand)
-    print(f"[1] Balance: {bal_url}")
-    balance = json.loads(_get(bal_url, timeout=15))
-
-    version   = balance["version"]["cur"]
-    zip_url   = balance["version"]["url"]
-    mirrors   = balance.get("mirrors", CDN_MIRRORS)
-    # update CDN_MIRRORS in-place from server response
-    CDN_MIRRORS[:] = mirrors + [m for m in CDN_MIRRORS if m not in mirrors]
-
+    print(f"[1] Fetching balance…")
+    balance  = json.loads(_get_bytes(BALANCE_URL.format(rand=rand), timeout=15))
+    version  = balance["version"]["cur"]
+    zip_url  = balance["version"]["url"]
+    mirrors  = balance.get("mirrors", [])
+    if mirrors:
+        CDN_MIRRORS[:] = mirrors + [m for m in CDN_MIRRORS if m not in mirrors]
     print(f"    Version : {version}")
     print(f"    ZIP URL : {zip_url}")
 
-    # ── Step 2: skip if already synced ───────────────────────────────────────
-    version_dir = OUT_DIR / version
-    latest_file = OUT_DIR / "latest.txt"
+    # 2. Check if already synced
+    print(f"[2] Checking existing state…")
+    head_sha  = gh_get_branch_sha()
+    tree_sha  = gh_get_commit_tree(head_sha)
+    print(f"    HEAD    : {head_sha[:12]}")
 
-    if latest_file.exists() and latest_file.read_text().strip() == version:
-        existing = list(version_dir.glob("*.bin")) if version_dir.exists() else []
-        if existing:
-            print(f"[!] Already at {version} with {len(existing)} bundles — nothing to do.")
-            return
+    if not FORCE_SYNC:
+        existing_files = gh_get_existing_files(version)
+        if existing_files:
+            print(f"    {len(existing_files)} files already in bundles/{version}/ — checking completeness…")
+        # We'll skip individual files that already exist (handled per-file below)
+    else:
+        existing_files = set()
+        print("    FORCE_SYNC=true — re-uploading everything")
 
-    # ── Step 3: download + decrypt config archive ─────────────────────────────
-    print(f"[2] Downloading config archive…")
-    outer_zip = _get(zip_url, timeout=120)
+    # 3. Download + decrypt config archive
+    print(f"[3] Downloading config archive…")
+    outer_zip = _get_bytes(zip_url, timeout=120)
     print(f"    {len(outer_zip):,} bytes")
 
     entries   = _zip_entries(outer_zip)
@@ -312,77 +364,119 @@ def main():
     if not enc_entry:
         sys.exit("ERROR: no .enc file in config archive")
 
-    print(f"[3] Decrypting {enc_entry[0]}…")
+    print(f"[4] Decrypting {enc_entry[0]}…")
     enc_data  = _extract_entry(outer_zip, enc_entry)
     inner_zip = aes128_cbc_decrypt(enc_data, AES_KEY, AES_IV)
     if inner_zip[:4] != b'PK\x03\x04':
-        sys.exit("ERROR: decryption produced invalid zip — wrong AES key?")
+        sys.exit("ERROR: decryption failed — wrong AES key?")
     print(f"    Decrypted to {len(inner_zip):,} bytes")
+    del outer_zip, enc_data  # free memory
 
-    # ── Step 4: parse bundlesConfig ───────────────────────────────────────────
-    print(f"[4] Parsing bundlesConfig…")
+    # 4. Parse bundlesConfig
+    print(f"[5] Parsing bundlesConfig…")
     inner_entries = _zip_entries(inner_zip)
     cfg_entry = next(
         (e for e in inner_entries
-         if re.search(rf'bundlesConfig_\d+_{re.escape(PLATFORM)}\.bytes', e[0])),
-        None
+         if re.search(rf'bundlesConfig_\d+_{re.escape(PLATFORM)}\.bytes', e[0])), None
     )
     if not cfg_entry:
-        # Fallback: list available config files
         available = [e[0] for e in inner_entries if 'bundlesConfig' in e[0]]
-        sys.exit(f"ERROR: no bundlesConfig for platform '{PLATFORM}'. Available: {available}")
+        sys.exit(f"ERROR: no bundlesConfig for '{PLATFORM}'. Available: {available}")
 
-    cfg_name = cfg_entry[0]
-    m = re.search(r'bundlesConfig_(\d+)_', cfg_name)
+    m = re.search(r'bundlesConfig_(\d+)_', cfg_entry[0])
     bundle_set = m.group(1) if m else "6"
-    cdn_base = f"https://sfacdn.nekki.com/Bundles/ArenaBundles{bundle_set}/{PLATFORM}/archives/"
-    print(f"    Config  : {cfg_name}")
+    cdn_base   = f"{CDN_MIRRORS[0]}/Bundles/ArenaBundles{bundle_set}/{PLATFORM}/archives/"
+    print(f"    Config  : {cfg_entry[0]}  (set={bundle_set})")
     print(f"    CDN base: {cdn_base}")
 
     cfg_bytes = _extract_entry(inner_zip, cfg_entry)
-    archives  = parse_bundle_config(cfg_bytes, PLATFORM)
-    print(f"    Archives: {len(archives)} unique bundle names")
+    del inner_zip
+    archives  = sorted(parse_bundle_config(cfg_bytes))
+    print(f"    Archives: {len(archives)} unique names")
 
-    # ── Step 5: download bundles ──────────────────────────────────────────────
-    version_dir.mkdir(parents=True, exist_ok=True)
-    existing = {p.name for p in version_dir.glob("*.bin")}
-    to_download = sorted(a for a in archives if f"{a}.bin" not in existing)
-    print(f"[5] Downloading {len(to_download)} bundles (skipping {len(existing)} already present)…")
-    print(f"    Workers : {WORKERS}")
+    # 5. Filter out already-present files
+    to_upload = [
+        a for a in archives
+        if f"{a}.bin" not in existing_files
+    ]
+    skipped = len(archives) - len(to_upload)
+    print(f"    Skipping: {skipped} already in repo  |  Uploading: {len(to_upload)}")
 
-    downloaded = 0; failed = 0; total_bytes = 0
+    if not to_upload:
+        print("Nothing to do.")
+        return
 
-    def fetch_one(archive_name: str):
-        url  = cdn_base + archive_name + ".bin"
-        data = _get_with_retry(url)
-        dest = version_dir / f"{archive_name}.bin"
-        dest.write_bytes(data)
-        return len(data)
+    # 6. Download + upload blobs in parallel, commit in batches
+    print(f"[6] Uploading blobs ({WORKERS} workers, {BATCH_SIZE} per commit)…")
+    current_head = head_sha
+    current_tree = tree_sha
+
+    work = [
+        (name, cdn_base, f"bundles/{version}/{name}.bin")
+        for name in to_upload
+    ]
+
+    total     = len(work)
+    done      = 0
+    failed    = 0
+    batch_num = 0
 
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        futures = {pool.submit(fetch_one, name): name for name in to_download}
-        for i, fut in enumerate(as_completed(futures), 1):
+        # Submit all jobs; collect results and flush to GitHub in BATCH_SIZE chunks
+        pending_entries = []   # (repo_path, blob_sha) ready for current batch
+        futures = {pool.submit(download_and_upload_blob, item): item[0] for item in work}
+
+        for fut in as_completed(futures):
             name = futures[fut]
             try:
-                nb = fut.result()
-                downloaded += 1; total_bytes += nb
+                repo_path, blob_sha = fut.result()
+                pending_entries.append({
+                    "path": repo_path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "sha":  blob_sha,
+                })
             except Exception as e:
                 failed += 1
                 print(f"  FAIL {name}: {e}", file=sys.stderr)
-            if i % 100 == 0 or i == len(to_download):
-                pct = i / len(to_download) * 100
-                mb  = total_bytes / 1024 / 1024
-                print(f"  {i}/{len(to_download)} ({pct:.0f}%)  {mb:.1f} MB  failures={failed}")
 
-    print(f"[6] Done.  Downloaded={downloaded}  Failed={failed}  Total={total_bytes/1024/1024:.1f} MB")
+            done += 1
 
-    # Write latest.txt
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    latest_file.write_text(version + "\n")
-    print(f"    Written bundles/{version}/ and bundles/latest.txt")
+            # Flush a batch when it's full OR we've processed everything
+            if len(pending_entries) >= BATCH_SIZE or (done == total and pending_entries):
+                batch_num += 1
+                count = len(pending_entries)
+                msg   = (
+                    f"sync: {version} [{PLATFORM}] "
+                    f"batch {batch_num} ({count} files, {done}/{total} total)"
+                )
+                new_tree   = gh_create_tree(current_tree, pending_entries)
+                new_commit = gh_create_commit(new_tree, current_head, msg)
+                gh_update_ref(new_commit)
+                current_head = new_commit
+                current_tree = new_tree
+                pending_entries = []
+                pct = done / total * 100
+                print(f"  ✓ batch {batch_num}: {count} files committed ({pct:.0f}%, failures={failed})")
 
-    if failed > 0:
-        sys.exit(f"Exiting with error: {failed} bundles failed to download")
+    # 7. Update latest.txt
+    print(f"[7] Updating bundles/latest.txt…")
+    latest_blob = gh_upload_blob((version + "\n").encode())
+    final_tree  = gh_create_tree(current_tree, [{
+        "path": "bundles/latest.txt",
+        "mode": "100644",
+        "type": "blob",
+        "sha":  latest_blob,
+    }])
+    final_commit = gh_create_commit(
+        final_tree, current_head,
+        f"sync: {version} [{PLATFORM}] — done ({total} total, {failed} failed)"
+    )
+    gh_update_ref(final_commit)
+
+    print(f"\nDone. {total - failed}/{total} bundles committed in {batch_num} batches.")
+    if failed:
+        sys.exit(f"Exiting with error: {failed} bundles failed")
 
 
 if __name__ == "__main__":
