@@ -26,6 +26,7 @@ import os
 import random
 import re
 import struct
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -44,6 +45,8 @@ BALANCE_URL = (
 # AES-128-CBC key + IV (verified for SFA config archives)
 AES_KEY = bytes.fromhex("08050674cc9ab867197f0cad55a770ca")
 AES_IV  = bytes.fromhex("653e0715236e0f734f1ebf64228b322d")
+
+ZSTD_MAGIC = bytes.fromhex("28b52ffd")
 
 CDN_MIRRORS = [
     "https://sfacdn.nekki.com",
@@ -153,6 +156,18 @@ def aes128_cbc_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
         prev = blk
     pad = out[-1]
     return bytes(out[:-pad]) if 1 <= pad <= 16 else bytes(out)
+
+
+def zstd_decompress(data: bytes) -> bytes:
+    proc = subprocess.run(
+        ["zstd", "-d", "-c"],
+        input=data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"zstd decompress failed: {proc.stderr.decode(errors='replace')}")
+    return proc.stdout
 
 
 # ── Minimal ZIP reader ────────────────────────────────────────────────────────
@@ -355,6 +370,8 @@ def main():
     def fetch_one(archive_name: str):
         url  = cdn_base + archive_name + ".bin"
         data = _get_with_retry(url)
+        if data[:4] == ZSTD_MAGIC:
+            data = zstd_decompress(data)
         dest = version_dir / f"{archive_name}.bin"
         dest.write_bytes(data)
         return len(data)

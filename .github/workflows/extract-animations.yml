@@ -1,0 +1,84 @@
+name: Extract Animations
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Bundle version folder to read raw .bin files from (e.g. 1.9.80.21.26220-prod)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      INPUT_DIR: bundles/${{ github.event.inputs.version }}
+      OUTPUT_DIR: bundles/assets
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify raw bundle version folder exists
+        run: |
+          if [ ! -d "${INPUT_DIR}" ]; then
+            echo "ERROR: ${INPUT_DIR} does not exist in this repo" >&2
+            exit 1
+          fi
+          echo "Found ${INPUT_DIR} with $(find "${INPUT_DIR}" -maxdepth 1 -name '*.bin' | wc -l) .bin files"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install UnityPy zstandard --break-system-packages
+
+      - name: Extract animations
+        run: python3 scripts/extract_animations.py
+
+      - name: Commit and push animations
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 1048576000
+
+          git add -A -- "${OUTPUT_DIR}"
+          git status --short -- "${OUTPUT_DIR}"
+
+          if git diff --cached --quiet -- "${OUTPUT_DIR}"; then
+            echo "No change in ${OUTPUT_DIR}, nothing to commit."
+            exit 0
+          fi
+
+          TOTAL=$(git diff --cached --name-only -- "${OUTPUT_DIR}" | wc -l)
+          git commit -q -m "extract: animations for ${VERSION} (${TOTAL} files changed)"
+
+          for attempt in 1 2 3; do
+            git push origin main && break
+            echo "  Push attempt $attempt failed, retrying in 15s…"
+            sleep 15
+            if [ "$attempt" -eq 3 ]; then
+              echo "ERROR: push failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
+
+      - name: Summary
+        run: |
+          COUNT=$(find "${OUTPUT_DIR}" -type f 2>/dev/null | wc -l || echo 0)
+          echo "## Animation Extraction Summary" >> $GITHUB_STEP_SUMMARY
+          echo ""                                >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |"                  >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|"                  >> $GITHUB_STEP_SUMMARY
+          echo "| Source version | \`${VERSION}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Animations     | ${COUNT} |"        >> $GITHUB_STEP_SUMMARY
