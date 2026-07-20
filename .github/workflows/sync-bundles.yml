@@ -98,10 +98,15 @@ jobs:
         run: |
           VERSION="${{ steps.version_check.outputs.version }}"
           PLATFORM="${{ env.SFA_PLATFORM }}"
-          BATCH_SIZE=50
+          BATCH_SIZE=25
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Increase HTTP buffer to 500 MB and force HTTP/1.1 to avoid
+          # pack-size timeouts (HTTP 408/500) on large binary pushes
+          git config http.postBuffer 524288000
+          git config http.version HTTP/1.1
 
           # Collect all untracked / modified files under bundles/
           mapfile -t NEW_FILES < <(git ls-files --others --modified --exclude-standard bundles/)
