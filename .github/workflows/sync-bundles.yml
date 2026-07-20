@@ -1,0 +1,139 @@
+name: Sync SFA Bundles
+
+on:
+  schedule:
+    # Run daily at 06:00 UTC — picks up any new game version automatically
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Platform (Android / iOS / StandaloneWindows)"
+        required: false
+        default: "Android"
+      force:
+        description: "Force re-download even if version unchanged (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write   # needed to push the bundle commit
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180   # 4000+ bundles can take a while
+
+    env:
+      SFA_PLATFORM: ${{ github.event.inputs.platform || 'Android' }}
+      FORCE_SYNC:   ${{ github.event.inputs.force    || 'false' }}
+      OUT_DIR:      bundles
+      WORKERS:      16
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          # Fetch only the last commit — we don't need history for bundle files
+          fetch-depth: 1
+          # Use the default GITHUB_TOKEN (write permission granted above)
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Python setup ────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      # No pip deps needed — sync_bundles.py uses only stdlib
+      - name: Verify Python
+        run: python3 --version
+
+      # ── Check current version ────────────────────────────────────────────────
+      - name: Check latest game version
+        id: version_check
+        run: |
+          python3 - << 'EOF'
+          import json, random, urllib.request, os
+
+          rand = random.randint(10000, 99999)
+          url = (
+            f"https://sfalb.nekki.com/balance"
+            f"?w=PROD-AS&fv=1.9.80.20.26181-prod&rand={rand}&p=Android&client_version=1.9.81"
+          )
+          req = urllib.request.Request(url, headers={"User-Agent": "UnityPlayer/2022.3"})
+          with urllib.request.urlopen(req, timeout=15) as r:
+              bal = json.loads(r.read())
+
+          version = bal["version"]["cur"]
+          print(f"Latest version: {version}")
+
+          # Write to GITHUB_OUTPUT
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={version}\n")
+
+          # Check if already synced
+          import pathlib
+          latest_file = pathlib.Path("bundles/latest.txt")
+          already_done = (
+              latest_file.exists()
+              and latest_file.read_text().strip() == version
+              and os.environ.get("FORCE_SYNC", "false").lower() != "true"
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"already_synced={'true' if already_done else 'false'}\n")
+
+          if already_done:
+              print(f"Already synced at {version} — will skip download step.")
+          EOF
+
+      # ── Download bundles ─────────────────────────────────────────────────────
+      - name: Download bundles
+        if: steps.version_check.outputs.already_synced != 'true'
+        run: python3 scripts/sync_bundles.py
+
+      # ── Commit + push ────────────────────────────────────────────────────────
+      - name: Commit and push new bundles
+        if: steps.version_check.outputs.already_synced != 'true'
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          PLATFORM="${{ env.SFA_PLATFORM }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage everything under bundles/
+          git add bundles/
+
+          # Check if there's actually anything new
+          if git diff --cached --quiet; then
+            echo "No new files to commit."
+            exit 0
+          fi
+
+          ADDED=$(git diff --cached --name-only | wc -l)
+          git commit -m "sync: ${VERSION} [${PLATFORM}] — ${ADDED} files"
+
+          # Push with retry in case of concurrent runs
+          for attempt in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            echo "Push attempt $attempt failed, retrying…"
+            sleep 10
+          done
+
+      # ── Summary ──────────────────────────────────────────────────────────────
+      - name: Summary
+        run: |
+          VERSION="${{ steps.version_check.outputs.version }}"
+          SYNCED="${{ steps.version_check.outputs.already_synced }}"
+          COUNT=$(find bundles/${VERSION} -name '*.bin' 2>/dev/null | wc -l || echo 0)
+
+          echo "## Bundle Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo ""                       >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |"        >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|"        >> $GITHUB_STEP_SUMMARY
+          echo "| Version  | \`${VERSION}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | \`${{ env.SFA_PLATFORM }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Bundles  | ${COUNT} |"        >> $GITHUB_STEP_SUMMARY
+          echo "| Skipped  | ${SYNCED} |"       >> $GITHUB_STEP_SUMMARY
