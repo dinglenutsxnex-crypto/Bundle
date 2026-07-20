@@ -1,8 +1,6 @@
 name: Sync SFA Bundles
 
 on:
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       platform:
@@ -17,17 +15,20 @@ on:
 permissions:
   contents: write
 
+env:
+  SFA_PLATFORM: ${{ github.event.inputs.platform || 'Android' }}
+  FORCE_SYNC:   ${{ github.event.inputs.force    || 'false' }}
+  OUT_DIR:      bundles
+  WORKERS:      16
+  SHARDS:       4
+
 jobs:
-  sync:
+  download:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
-
-    env:
-      SFA_PLATFORM: ${{ github.event.inputs.platform || 'Android' }}
-      FORCE_SYNC:   ${{ github.event.inputs.force    || 'false' }}
-      OUT_DIR:      bundles
-      WORKERS:      16
-
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version_check.outputs.version }}
+      already_synced: ${{ steps.version_check.outputs.already_synced }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -39,9 +40,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Verify Python
-        run: python3 --version
 
       - name: Check latest game version
         id: version_check
@@ -82,66 +80,132 @@ jobs:
         if: steps.version_check.outputs.already_synced != 'true'
         run: python3 scripts/sync_bundles.py
 
-      - name: Commit and push new bundles
+      - name: Split downloaded files into shards
         if: steps.version_check.outputs.already_synced != 'true'
         run: |
-          VERSION="${{ steps.version_check.outputs.version }}"
+          mkdir -p shard_lists
+          find bundles -type f -name '*.bin' | sort > all_files.txt
+          split -n l/${{ env.SHARDS }} -d --additional-suffix=.txt all_files.txt shard_lists/shard_
+          ls -la shard_lists/
+          for f in shard_lists/*.txt; do
+            echo "$f: $(wc -l < "$f") files"
+          done
+
+      - name: Upload bundles + shard lists as artifact
+        if: steps.version_check.outputs.already_synced != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-payload
+          path: |
+            bundles/
+            shard_lists/
+          retention-days: 1
+
+  push-shard:
+    needs: download
+    if: needs.download.outputs.already_synced != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bundle-payload
+          path: payload
+
+      - name: Create branch and copy this shard's files
+        run: |
+          VERSION="${{ needs.download.outputs.version }}"
+          SHARD_NUM=${{ matrix.shard }}
+          BRANCH="sync-shard-${SHARD_NUM}-${{ github.run_id }}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config http.postBuffer 1048576000
+          git config pack.threads 0
+
+          git checkout -b "$BRANCH"
+
+          SHARD_LIST=$(printf "payload/shard_lists/shard_%02d.txt" "$SHARD_NUM")
+          if [ ! -s "$SHARD_LIST" ]; then
+            echo "Shard $SHARD_NUM is empty, nothing to push."
+            exit 0
+          fi
+
+          mkdir -p bundles
+          while IFS= read -r f; do
+            rel="${f#bundles/}"
+            mkdir -p "bundles/$(dirname "$rel")"
+            cp "payload/$f" "bundles/$rel"
+          done < "$SHARD_LIST"
+
+          if [ "$SHARD_NUM" -eq 0 ] && [ -f "payload/bundles/latest.txt" ]; then
+            cp payload/bundles/latest.txt bundles/latest.txt
+          fi
+
+          git add bundles/
+          COUNT=$(wc -l < "$SHARD_LIST")
+          git commit -q -m "sync: ${VERSION} shard ${SHARD_NUM} (${COUNT} files)" || echo "nothing to commit"
+          git push origin "$BRANCH"
+
+  merge:
+    needs: [download, push-shard]
+    if: always() && needs.download.outputs.already_synced != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge shard branches into main
+        run: |
+          VERSION="${{ needs.download.outputs.version }}"
           PLATFORM="${{ env.SFA_PLATFORM }}"
-          MAX_BATCH_BYTES=$(( 150 * 1024 * 1024 ))
 
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config http.postBuffer 1048576000
 
-          mapfile -t NEW_FILES < <(git ls-files --others --modified --exclude-standard bundles/)
-          TOTAL=${#NEW_FILES[@]}
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "No new files to commit."
-            exit 0
-          fi
-          echo "Total new files: $TOTAL"
+          git checkout main
+          git pull origin main
 
-          push_with_retry() {
-            for attempt in 1 2 3; do
-              git push origin main && return 0
-              echo "  Push attempt $attempt failed, retrying in 15s…"
-              sleep 15
-            done
-            echo "ERROR: push failed after 3 attempts" >&2
-            return 1
-          }
-
-          BATCH_NUM=0
-          CHUNK=()
-          CHUNK_BYTES=0
-
-          flush() {
-            [ "${#CHUNK[@]}" -eq 0 ] && return 0
-            BATCH_NUM=$(( BATCH_NUM + 1 ))
-            git add "${CHUNK[@]}"
-            git commit -q -m "sync: ${VERSION} [${PLATFORM}] batch ${BATCH_NUM} (${#CHUNK[@]} files)"
-            echo "Pushing batch ${BATCH_NUM} (${#CHUNK[@]} files, ~$(( CHUNK_BYTES / 1024 / 1024 ))MB)…"
-            push_with_retry || exit 1
-            CHUNK=()
-            CHUNK_BYTES=0
-          }
-
-          for f in "${NEW_FILES[@]}"; do
-            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
-            if [ "$CHUNK_BYTES" -gt 0 ] && [ $(( CHUNK_BYTES + SIZE )) -gt "$MAX_BATCH_BYTES" ]; then
-              flush
+          for SHARD_NUM in 0 1 2 3; do
+            BRANCH="sync-shard-${SHARD_NUM}-${{ github.run_id }}"
+            if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+              echo "Merging $BRANCH…"
+              git fetch origin "$BRANCH"
+              git merge --no-edit "origin/$BRANCH" -m "merge: ${VERSION} [${PLATFORM}] shard ${SHARD_NUM}"
+            else
+              echo "$BRANCH does not exist (empty shard), skipping."
             fi
-            CHUNK+=("$f")
-            CHUNK_BYTES=$(( CHUNK_BYTES + SIZE ))
           done
-          flush
 
-          echo "All $TOTAL files committed and pushed in $BATCH_NUM batches."
+          git push origin main
+
+      - name: Delete shard branches
+        if: always()
+        run: |
+          for SHARD_NUM in 0 1 2 3; do
+            BRANCH="sync-shard-${SHARD_NUM}-${{ github.run_id }}"
+            git push origin --delete "$BRANCH" 2>/dev/null || echo "$BRANCH already gone"
+          done
 
       - name: Summary
         run: |
-          VERSION="${{ steps.version_check.outputs.version }}"
-          SYNCED="${{ steps.version_check.outputs.already_synced }}"
+          VERSION="${{ needs.download.outputs.version }}"
           COUNT=$(find bundles/${VERSION} -name '*.bin' 2>/dev/null | wc -l || echo 0)
 
           echo "## Bundle Sync Summary" >> $GITHUB_STEP_SUMMARY
@@ -151,4 +215,4 @@ jobs:
           echo "| Version  | \`${VERSION}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Platform | \`${{ env.SFA_PLATFORM }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Bundles  | ${COUNT} |"        >> $GITHUB_STEP_SUMMARY
-          echo "| Skipped  | ${SYNCED} |"       >> $GITHUB_STEP_SUMMARY
+          echo "| Shards   | ${{ env.SHARDS }} |" >> $GITHUB_STEP_SUMMARY
