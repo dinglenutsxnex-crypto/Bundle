@@ -20,8 +20,15 @@ Magic header (6 bytes):
     EE C0 D2 C2 22 A0
 
 Env vars:
-    INPUT_DIR   – folder containing the raw *.bin bundles to scan (required)
-    OUTPUT_DIR  – where extracted animations are written (default: bundles/assets)
+    INPUT_DIR    – folder containing the raw *.bin bundles to scan (required)
+    OUTPUT_DIR   – where extracted animations are written (default: bundles/assets)
+    SHARD_INDEX  – which shard this run handles, 0-based (default: 0)
+    SHARD_TOTAL  – how many shards total (default: 1, meaning no sharding)
+
+Sharding splits the sorted bundle list into SHARD_TOTAL equal slices and
+processes only the slice at SHARD_INDEX. The split is deterministic (same
+sort, same slice math every run), so re-running one shard only touches
+that shard's files and never overlaps another shard's output filenames.
 """
 
 import os
@@ -49,9 +56,16 @@ ZSTD_MAGIC = bytes.fromhex("28b52ffd")
 
 INPUT_DIR = os.environ.get("INPUT_DIR")
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "bundles/assets"))
+SHARD_INDEX = int(os.environ.get("SHARD_INDEX", "0"))
+SHARD_TOTAL = int(os.environ.get("SHARD_TOTAL", "1"))
 
 if not INPUT_DIR:
     sys.exit("ERROR: INPUT_DIR env var is required")
+
+if SHARD_TOTAL < 1:
+    sys.exit(f"ERROR: SHARD_TOTAL must be >= 1, got {SHARD_TOTAL}")
+if not (0 <= SHARD_INDEX < SHARD_TOTAL):
+    sys.exit(f"ERROR: SHARD_INDEX must be in [0, {SHARD_TOTAL}), got {SHARD_INDEX}")
 
 input_dir = Path(INPUT_DIR)
 if not input_dir.is_dir():
@@ -69,8 +83,13 @@ def load_bundle(bin_path: Path):
         raw_bytes = dctx.decompress(raw_bytes, max_output_size=500 * 1024 * 1024)
     return UnityPy.load(raw_bytes)
 
-bin_files = sorted(input_dir.glob("*.bin"))
-print(f"Scanning {len(bin_files)} bundle(s) in {input_dir}")
+all_bin_files = sorted(input_dir.glob("*.bin"))
+bin_files = all_bin_files[SHARD_INDEX::SHARD_TOTAL]
+
+if SHARD_TOTAL > 1:
+    print(f"Shard {SHARD_INDEX}/{SHARD_TOTAL}: {len(bin_files)} of {len(all_bin_files)} bundle(s) in {input_dir}")
+else:
+    print(f"Scanning {len(bin_files)} bundle(s) in {input_dir}")
 
 total_text_assets = 0
 kept = 0
@@ -125,7 +144,8 @@ for bin_path in bin_files:
         dest.write_bytes(raw)
         kept += 1
 
-print(f"\nDone.")
+shard_label = f" (shard {SHARD_INDEX}/{SHARD_TOTAL})" if SHARD_TOTAL > 1 else ""
+print(f"\nDone{shard_label}.")
 print(f"  Bundles scanned       : {len(bin_files)}")
 print(f"  Bundles failed to load: {failed_bundles}")
 print(f"  TextAssets seen       : {total_text_assets}")

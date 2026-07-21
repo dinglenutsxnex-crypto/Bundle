@@ -76,12 +76,6 @@ jobs:
               print(f"Already synced at {version} — will skip download step.")
           EOF
 
-      - name: Install zstd
-        if: steps.version_check.outputs.already_synced != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y zstd
-
       - name: Download bundles
         if: steps.version_check.outputs.already_synced != 'true'
         run: python3 scripts/sync_bundles.py

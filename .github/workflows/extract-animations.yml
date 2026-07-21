@@ -10,16 +10,17 @@ on:
 permissions:
   contents: write
 
+env:
+  SHARD_TOTAL: 4
+
 jobs:
-  extract:
+  extract-shard:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
-
-    env:
-      VERSION: ${{ github.event.inputs.version }}
-      INPUT_DIR: bundles/${{ github.event.inputs.version }}
-      OUTPUT_DIR: bundles/assets
-
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -29,11 +30,12 @@ jobs:
 
       - name: Verify raw bundle version folder exists
         run: |
-          if [ ! -d "${INPUT_DIR}" ]; then
-            echo "ERROR: ${INPUT_DIR} does not exist in this repo" >&2
+          INPUT_DIR="bundles/${{ github.event.inputs.version }}"
+          if [ ! -d "$INPUT_DIR" ]; then
+            echo "ERROR: $INPUT_DIR does not exist in this repo" >&2
             exit 1
           fi
-          echo "Found ${INPUT_DIR} with $(find "${INPUT_DIR}" -maxdepth 1 -name '*.bin' | wc -l) .bin files"
+          echo "Found $INPUT_DIR with $(find "$INPUT_DIR" -maxdepth 1 -name '*.bin' | wc -l) .bin files"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -43,8 +45,69 @@ jobs:
       - name: Install dependencies
         run: pip install UnityPy zstandard --break-system-packages
 
-      - name: Extract animations
+      - name: Extract this shard's animations
+        env:
+          INPUT_DIR: bundles/${{ github.event.inputs.version }}
+          OUTPUT_DIR: shard_output/shard_${{ matrix.shard }}
+          SHARD_INDEX: ${{ matrix.shard }}
         run: python3 scripts/extract_animations.py
+
+      - name: Upload shard output as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: shard_output/shard_${{ matrix.shard }}/
+          if-no-files-found: ignore
+          retention-days: 1
+
+  merge:
+    needs: extract-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      OUTPUT_DIR: bundles/assets
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: shard_downloads
+          pattern: shard-*
+
+      - name: Flatten shards into bundles/assets, resolving name collisions
+        run: |
+          rm -rf "${OUTPUT_DIR}"
+          mkdir -p "${OUTPUT_DIR}"
+
+          COLLISIONS=0
+          for shard_dir in shard_downloads/shard-*/; do
+            [ -d "$shard_dir" ] || continue
+            for f in "$shard_dir"*.bin; do
+              [ -e "$f" ] || continue
+              base=$(basename "$f")
+              dest="${OUTPUT_DIR}/${base}"
+              if [ -e "$dest" ]; then
+                COLLISIONS=$((COLLISIONS + 1))
+                stem="${base%.bin}"
+                dest="${OUTPUT_DIR}/${stem}_$(md5sum "$f" | cut -c1-8).bin"
+              fi
+              cp "$f" "$dest"
+            done
+          done
+
+          echo "Flattened $(find "${OUTPUT_DIR}" -type f | wc -l) file(s) into ${OUTPUT_DIR}"
+          if [ "$COLLISIONS" -gt 0 ]; then
+            echo "Resolved $COLLISIONS filename collision(s) across shards by appending a content hash."
+          fi
 
       - name: Commit and push animations
         run: |
@@ -82,3 +145,4 @@ jobs:
           echo "|-----|-------|"                  >> $GITHUB_STEP_SUMMARY
           echo "| Source version | \`${VERSION}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Animations     | ${COUNT} |"        >> $GITHUB_STEP_SUMMARY
+          echo "| Shards         | ${{ env.SHARD_TOTAL }} |" >> $GITHUB_STEP_SUMMARY
