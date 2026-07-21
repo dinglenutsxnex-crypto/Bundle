@@ -5,8 +5,8 @@ on:
     inputs:
       input_dir:
         description: "Folder containing .bin animation files to process (relative to repo root)"
-        required: true
-        default: "animations"
+        required: false
+        default: "bundles/assets"
       output_dir:
         description: "Where to write CSV output (relative to repo root)"
         required: false
