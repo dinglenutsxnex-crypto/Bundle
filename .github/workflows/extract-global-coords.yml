@@ -1,0 +1,96 @@
+name: Extract Global Coordinates
+
+on:
+  workflow_dispatch:
+    inputs:
+      input_dir:
+        description: "Folder containing .bin animation files to process (relative to repo root)"
+        required: true
+        default: "animations"
+      output_dir:
+        description: "Where to write CSV output (relative to repo root)"
+        required: false
+        default: "animations_csv"
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      INPUT_DIR: ${{ github.event.inputs.input_dir }}
+      OUTPUT_DIR: ${{ github.event.inputs.output_dir }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify input folder exists and has .bin files
+        run: |
+          if [ ! -d "${INPUT_DIR}" ]; then
+            echo "ERROR: ${INPUT_DIR} does not exist in this repo" >&2
+            exit 1
+          fi
+          COUNT=$(find "${INPUT_DIR}" -maxdepth 1 -name '*.bin' | wc -l)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: no .bin files found in ${INPUT_DIR}" >&2
+            exit 1
+          fi
+          echo "Found $COUNT .bin file(s) in ${INPUT_DIR}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extract global coordinates for every .bin file
+        run: |
+          mkdir -p "${OUTPUT_DIR}"
+          FAILED=0
+          for f in "${INPUT_DIR}"/*.bin; do
+            name=$(basename "$f" .bin)
+            echo "--- $name ---"
+            python3 scripts/extract_global_coords.py "$f" \
+              -o "${OUTPUT_DIR}/${name}.csv" \
+              --skeleton scripts/skeleton_definition.txt \
+              || FAILED=$((FAILED + 1))
+          done
+          echo "Failed: $FAILED"
+          if [ "$FAILED" -gt 0 ]; then
+            echo "ERROR: $FAILED file(s) failed to parse" >&2
+            exit 1
+          fi
+
+      - name: Commit and push CSVs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add -A -- "${OUTPUT_DIR}"
+          git status --short -- "${OUTPUT_DIR}"
+
+          if git diff --cached --quiet -- "${OUTPUT_DIR}"; then
+            echo "No change in ${OUTPUT_DIR}, nothing to commit."
+            exit 0
+          fi
+
+          TOTAL=$(git diff --cached --name-only -- "${OUTPUT_DIR}" | wc -l)
+          git commit -q -m "extract: global coords for ${TOTAL} animation(s)"
+          git push origin main
+
+      - name: Summary
+        run: |
+          COUNT=$(find "${OUTPUT_DIR}" -name '*.csv' 2>/dev/null | wc -l || echo 0)
+          echo "## Global Coordinate Extraction Summary" >> $GITHUB_STEP_SUMMARY
+          echo ""                                         >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |"                            >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|"                            >> $GITHUB_STEP_SUMMARY
+          echo "| Input folder  | \`${INPUT_DIR}\` |"        >> $GITHUB_STEP_SUMMARY
+          echo "| Output folder | \`${OUTPUT_DIR}\` |"       >> $GITHUB_STEP_SUMMARY
+          echo "| CSVs written  | ${COUNT} |"                >> $GITHUB_STEP_SUMMARY
