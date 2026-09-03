@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SFA Animation Player (lightweight)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0d1117; color: #e6edf3; font: 14px/1.4 system-ui, sans-serif; }
+  header { padding: 10px 14px; border-bottom: 1px solid #21262d; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  header h1 { font-size: 16px; margin: 0 12px 0 0; }
+  #wrap { display: flex; gap: 0; height: calc(100vh - 57px); }
+  #side { width: 300px; padding: 12px; border-right: 1px solid #21262d; overflow-y: auto; }
+  #side label { display: block; margin: 10px 0 4px; font-size: 12px; color: #8b949e; }
+  #side input[type=text], #side select { width: 100%; box-sizing: border-box; background: #161b22; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; }
+  #side button { background: #238636; color: #fff; border: 0; border-radius: 6px; padding: 7px 12px; cursor: pointer; margin-top: 8px; }
+  #side button.ghost { background: #21262d; }
+  #stage { flex: 1; position: relative; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #hud { position: absolute; left: 10px; bottom: 10px; background: rgba(13,17,23,.8); border: 1px solid #30363d; border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+  #scrub { width: 100%; margin-top: 6px; }
+  .row { display: flex; gap: 6px; align-items: center; margin-top: 8px; }
+  .row button { margin-top: 0; }
+  #msg { color: #f0883e; font-size: 12px; min-height: 18px; margin-top: 6px; }
+  kbd { background: #21262d; border-radius: 4px; padding: 0 5px; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SFA anim player</h1>
+  <span id="meta">no animation loaded</span>
+</header>
+<div id="wrap">
+  <div id="side">
+    <label>Move CSV (name in animations_csv, or full URL, or local file below)</label>
+    <input id="move" type="text" list="moves" value="k_prc_kick_1" spellcheck="false">
+    <datalist id="moves"></datalist>
+    <label>CSV base URL</label>
+    <input id="base" type="text" value="https://raw.githubusercontent.com/dinglenutsxnex-crypto/Bundle/main/animations_csv" spellcheck="false">
+    <div class="row">
+      <button id="load">Load</button>
+      <button id="localBtn" class="ghost">Local file…</button>
+      <input id="file" type="file" accept=".csv" hidden>
+    </div>
+    <label>Weapon rig (rigid attach to hands, v1)</label>
+    <select id="weapon"><option value="">(none)</option></select>
+    <label>View</label>
+    <select id="view">
+      <option value="side">side (x/y)</option>
+      <option value="front">front (z/y)</option>
+      <option value="top">top (x/z)</option>
+    </select>
+    <label>Speed <span id="spdV">1.0x</span></label>
+    <input id="spd" type="range" min="0.1" max="2" step="0.05" value="1">
+    <label><input id="showW" type="checkbox" checked> show weapon &nbsp;<input id="showL" type="checkbox" checked> labels (pelvis/hands)</label>
+    <div id="msg"></div>
+    <p style="font-size:11px;color:#8b949e">Space = play/pause · ←/→ = frame step · CSV: frame,bone_id,bone_name,x,y,z</p>
+  </div>
+  <div id="stage">
+    <canvas id="cv"></canvas>
+    <div id="hud">
+      <span id="frameInfo">frame –/–</span>
+      <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+// Body hierarchy (child -> parent). Weapon roots attach to weapon_l/weapon_r.
+const HIER = {"pelvis":null,"stomach":"pelvis","chest":"stomach","neck":"chest","head":"neck","hair":"head","zero_joint_hand_l":"chest","clavicle_l":"zero_joint_hand_l","arm_l":"clavicle_l","forearm_l":"arm_l","forearm_twist_l":"forearm_l","hand_l":"forearm_l","weapon_l":"hand_l","f_big1_l":"hand_l","f_big2_l":"f_big1_l","f_big3_l":"f_big2_l","f_main1_l":"hand_l","f_main2_l":"f_main1_l","f_main3_l":"f_main2_l","f_pointer1_l":"hand_l","f_pointer2_l":"f_pointer1_l","f_pointer3_l":"f_pointer2_l","scapular_l":"clavicle_l","chest_l":"zero_joint_hand_l","zero_joint_hand_r":"chest","clavicle_r":"zero_joint_hand_r","arm_r":"clavicle_r","forearm_r":"arm_r","forearm_twist_r":"forearm_r","hand_r":"forearm_r","weapon_r":"hand_r","f_pointer1_r":"hand_r","f_pointer2_r":"f_pointer1_r","f_pointer3_r":"f_pointer2_r","f_big1_r":"hand_r","f_big2_r":"f_big1_r","f_big3_r":"f_big2_r","f_main1_r":"hand_r","f_main2_r":"f_main1_r","f_main3_r":"f_main2_r","scapular_r":"clavicle_r","chest_r":"zero_joint_hand_r","zero_joint_pelvis_l":"pelvis","thigh_l":"zero_joint_pelvis_l","calf_l":"thigh_l","foot_l":"calf_l","toe_l":"foot_l","thigh_twist_l":"thigh_l","back_l":"zero_joint_pelvis_l","zero_joint_pelvis_r":"pelvis","thigh_r":"zero_joint_pelvis_r","calf_r":"thigh_r","foot_r":"calf_r","toe_r":"foot_r","back_r":"zero_joint_pelvis_r","biceps_twist_l":"arm_l","biceps_twist_r":"arm_r","thigh_twist_r":"thigh_r"};
+const KNOWN_MOVES = ["k_prc_kick_1","k_prc_kick_2","june_slash_1","june_slash_2","june_heavy","june_low_slash_1","katana_slash_1","katana_slash_2","ling_heavy_slash","katana_upper_slash","ling_spinning_slash","xiang_tzu_heavy_slash","June_common_stance_idle","throw_simple","s_ling_thrust_active","attack","dash"];
+let FRAMES = [], RIGS = null, RIG = null;
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+KNOWN_MOVES.forEach(m => { const o = document.createElement("option"); o.value = m; $("moves").appendChild(o); });
+
+function msg(t) { $("msg").textContent = t || ""; }
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const frames = new Map();
+  for (let i = 1; i < lines.length; i++) {
+    const p = lines[i].split(",");
+    if (p.length < 6) continue;
+    const f = +p[0], name = p[2].trim();
+    if (!frames.has(f)) frames.set(f, {});
+    frames.get(f)[name] = [+p[3], +p[4], +p[5]];
+  }
+  return [...frames.keys()].sort((a, b) => a - b).map(k => frames.get(k));
+}
+async function loadMove() {
+  msg("");
+  const name = $("move").value.trim();
+  const base = $("base").value.trim().replace(/\/$/, "");
+  try {
+    const r = await fetch(`${base}/${name}.csv`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    setFrames(parseCSV(await r.text()), name);
+  } catch (e) { msg(`load failed: ${e.message} (try Local file…)`); }
+}
+function guessWeapon(moveName) {
+  if (!RIGS) return;
+  const m = moveName.toLowerCase();
+  const heroes = [...new Set(Object.keys(RIGS).map(w => w.split("-")[0]))];
+  const hit = heroes.find(h => m.includes(h.replace("_", "")) || m.includes(h));
+  const cands = Object.keys(RIGS).filter(w => !hit || w.split("-")[0] === hit);
+  if (cands.length) { RIG = cands[0]; $("weapon").value = RIG; }
+}
+function setFrames(frames, name) {
+  FRAMES = frames;
+  guessWeapon(name);
+  state.frame = 0;
+  $("scrub").max = Math.max(0, frames.length - 1);
+  $("scrub").value = 0;
+  $("meta").textContent = `${name}: ${frames.length} frames`;
+  draw();
+}
+$("file").addEventListener("change", async e => {
+  const f = e.target.files[0];
+  if (f) setFrames(parseCSV(await f.text()), f.name.replace(/\.csv$/i, ""));
+});
+$("localBtn").onclick = () => $("file").click();
+
+// weapon rigs (sidecar JSON): {weapon: {bones: {id: {name, parent, pos, rot}}}}
+async function loadRigs() {
+  for (const u of ["./weapon_rigs.json", "weapon_rigs.json"]) {
+    try {
+      const r = await fetch(u);
+      if (r.ok) {
+        RIGS = await r.json();
+        const sel = $("weapon");
+        const groups = {};
+        Object.keys(RIGS).sort().forEach(w => {
+          const hero = w.split("-")[0];
+          (groups[hero] = groups[hero] || []).push(w);
+        });
+        Object.keys(groups).sort().forEach(hero => {
+          const g = document.createElement("optgroup"); g.label = hero;
+          groups[hero].forEach(w => {
+            const o = document.createElement("option"); o.value = w; o.textContent = w; g.appendChild(o);
+          });
+          sel.appendChild(g);
+        });
+        msg(`weapon rigs loaded (${Object.keys(RIGS).length})`);
+        return;
+      }
+    } catch (e) {}
+  }
+  msg("weapon_rigs.json not found next to player (body only).");
+}
+function weaponRoots() {
+  if (!RIGS || !RIG) return [];
+  const rig = RIGS[RIG];
+  if (!rig) return [];
+  // roots = bones whose parent is null or outside the rig
+  const names = new Set(Object.values(rig.bones).map(b => b.name));
+  return Object.values(rig.bones).filter(b => !b.parent || !names.has(b.parent));
+}
+function weaponChildren() {
+  if (!RIGS || !RIG) return {};
+  const rig = RIGS[RIG];
+  const kids = {};
+  Object.values(rig.bones).forEach(b => {
+    if (!b.parent) return;
+    (kids[b.parent] = kids[b.parent] || []).push(b.name);
+  });
+  return kids;
+}
+function anchorFor(rootName) {
+  if (/_r\b|_r$/i.test(rootName) && !/_l\b|_l$/i.test(rootName)) return "weapon_r";
+  if (/_l\b|_l$/i.test(rootName)) return "weapon_l";
+  return "pelvis";
+}
+
+// playback state
+const state = { frame: 0, playing: false, speed: 1, last: 0, acc: 0, view: "side", zoom: 1, ox: 0, oy: 0 };
+function proj(p) {
+  const v = state.view;
+  return v === "side" ? [p[0], p[1], p[2]] : v === "front" ? [p[2], p[1], p[0]] : [p[0], p[2], p[1]];
+}
+function fit() {
+  const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+}
+addEventListener("resize", () => { fit(); draw(); });
+function draw() {
+  fit();
+  const dpr = devicePixelRatio || 1, W = cv.width, H = cv.height;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = W / dpr, h = H / dpr;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0d1117"; ctx.fillRect(0, 0, w, h);
+  if (!FRAMES.length) {
+    ctx.fillStyle = "#8b949e"; ctx.font = "14px system-ui";
+    ctx.fillText("Load a move to play it.", 20, 30);
+    return;
+  }
+  const fr = FRAMES[state.frame];
+  // bounds
+  let xs = [], ys = [];
+  const P = {};
+  for (const n in fr) { const [x, y, z] = proj(fr[n]); P[n] = [x, y, z]; xs.push(x); ys.push(y); }
+  if (!xs.length) return;
+  let mnx = Math.min(...xs), mxx = Math.max(...xs), mny = Math.min(...ys), mxy = Math.max(...ys);
+  const sc = Math.min(w / Math.max(1, mxx - mnx), h / Math.max(1, mxy - mny)) * 0.8 * state.zoom;
+  const cx = (mnx + mxx) / 2 + state.ox, cy = (mny + mxy) / 2 + state.oy;
+  const X = x => w / 2 + (x - cx) * sc, Y = y => h / 2 - (y - cy) * sc;
+  const zw = Object.values(P).map(p => p[2]);
+  const z0 = Math.min(...zw), z1 = Math.max(...zw), zr = Math.max(1e-6, z1 - z0);
+  // weapon overlay (rigid attach to hands)
+  const WP = {};
+  if ($("showW").checked && RIG) {
+    const kids = weaponChildren();
+    const byName = name => Object.values(RIGS[RIG].bones).find(b => b.name === name);
+  const place = (name, parentPos) => {
+    const entry = byName(name);
+    const off = (entry && entry.pos) || [0, 0, 0];
+    // v1: rigid offsets in parent space (fixed orientation); articulation needs anim curves
+    WP[name] = [parentPos[0] + off[0], parentPos[1] + off[1], parentPos[2] + off[2]];
+    (kids[name] || []).forEach(k => place(k, WP[name]));
+  };
+    weaponRoots().forEach(rt => {
+      const a = anchorFor(rt.name);
+      if (P[a]) place(rt.name, P[a]);
+    });
+  }
+  const line = (a, b, color, lw) => {
+    ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.beginPath();
+    ctx.moveTo(X(a[0]), Y(a[1])); ctx.lineTo(X(b[0]), Y(b[1])); ctx.stroke();
+  };
+  // body bones
+  for (const n in HIER) {
+    const p = HIER[n];
+    if (!p || !P[n] || !P[p]) continue;
+    const t = (P[n][2] - z0) / zr;
+    line(P[p], P[n], `rgba(88,166,255,${0.45 + 0.55 * t})`, 2);
+  }
+  // weapon bones
+  if ($("showW").checked && RIG) {
+    const rig = RIGS[RIG];
+    Object.values(rig.bones).forEach(b => {
+      if (b.parent && WP[b.parent] && WP[b.name]) line(WP[b.parent], WP[b.name], "rgba(255,123,114,.9)", 2);
+    });
+  }
+  // joints
+  const dot = (p, r, c) => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), r, 0, 7); ctx.fill(); };
+  for (const n in P) dot(P[n], n === "pelvis" ? 5 : 2.5, n === "pelvis" ? "#f0883e" : "#58a6ff");
+  if ($("showW").checked) for (const n in WP) dot(WP[n], 2.5, "#ff7b72");
+  if ($("showL").checked) {
+    ctx.fillStyle = "#e6edf3"; ctx.font = "11px system-ui";
+    ["pelvis", "hand_l", "hand_r", "head", "foot_l", "foot_r"].forEach(n => {
+      if (P[n]) ctx.fillText(n, X(P[n][0]) + 6, Y(P[n][1]) - 6);
+    });
+  }
+  $("frameInfo").textContent = `frame ${state.frame + 1}/${FRAMES.length}${RIG ? " · " + RIG : ""}`;
+  if (+$("scrub").value !== state.frame) $("scrub").value = state.frame;
+}
+function tick(t) {
+  if (state.playing && FRAMES.length) {
+    const dt = Math.min(0.1, (t - state.last) / 1000 || 0);
+    state.acc += dt * 60 * state.speed; // 60fps base
+    const adv = Math.floor(state.acc);
+    if (adv > 0) {
+      state.acc -= adv;
+      state.frame = (state.frame + adv) % FRAMES.length;
+      draw();
+    }
+  }
+  state.last = t;
+  requestAnimationFrame(tick);
+}
+// controls
+$("load").onclick = loadMove;
+$("move").addEventListener("keydown", e => { if (e.key === "Enter") loadMove(); });
+$("weapon").onchange = e => { RIG = e.target.value || null; draw(); };
+$("view").onchange = e => { state.view = e.target.value; draw(); };
+$("spd").oninput = e => { state.speed = +e.target.value; $("spdV").textContent = state.speed.toFixed(2) + "x"; };
+$("showW").onchange = draw; $("showL").onchange = draw;
+$("scrub").oninput = e => { state.frame = +e.target.value; state.playing = false; draw(); };
+function toggle() { state.playing = !state.playing; }
+addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" && e.target.type === "text") return;
+  if (e.code === "Space") { e.preventDefault(); toggle(); }
+  if (e.key === "ArrowRight") { state.frame = Math.min(FRAMES.length - 1, state.frame + 1); draw(); }
+  if (e.key === "ArrowLeft") { state.frame = Math.max(0, state.frame - 1); draw(); }
+});
+cv.addEventListener("dblclick", toggle);
+// zoom/pan
+cv.addEventListener("wheel", e => { e.preventDefault(); state.zoom *= e.deltaY > 0 ? 0.9 : 1.1; draw(); }, { passive: false });
+let drag = null;
+cv.addEventListener("pointerdown", e => { drag = [e.clientX, e.clientY]; });
+addEventListener("pointerup", () => drag = null);
+addEventListener("pointermove", e => {
+  if (!drag) return;
+  state.ox -= (e.clientX - drag[0]) * 0.5; state.oy += (e.clientY - drag[1]) * 0.5;
+  drag = [e.clientX, e.clientY]; draw();
+});
+// play button in HUD
+const pb = document.createElement("button");
+pb.textContent = "▶/⏸"; pb.className = "ghost"; pb.style.cssText = "background:#21262d;color:#fff;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;margin-right:8px";
+pb.onclick = toggle;
+$("hud").prepend(pb);
+loadRigs().finally(() => { fit(); loadMove(); requestAnimationFrame(tick); });
+</script>
+</body>
+</html>
