@@ -167,8 +167,11 @@ function weaponChildren() {
   return kids;
 }
 function anchorFor(rootName) {
-  if (/_r\b|_r$/i.test(rootName) && !/_l\b|_l$/i.test(rootName)) return "weapon_r";
-  if (/_l\b|_l$/i.test(rootName)) return "weapon_l";
+  const n = rootName.toLowerCase();
+  if (n.includes("scabbard")) return "pelvis";
+  const isR = /_r$/.test(n), isL = /_l$/.test(n);
+  if (isR && !isL) return "weapon_r";
+  if (isL && !isR) return "weapon_l";
   return "pelvis";
 }
 
