@@ -323,8 +323,11 @@ function draw() {
     ["pelvis", "hand_l", "hand_r", "head", "foot_l", "foot_r"].forEach(n => {
       if (P[n]) ctx.fillText(n, X(P[n][0]) + 6, Y(P[n][1]) - 6);
     });
+    ctx.fillStyle = "#00ff00"; ctx.font = "10px system-ui";
+    for (const n in WP) ctx.fillText(n, X(WP[n][0]) + 6, Y(WP[n][1]) - 6);
   }
-  $("frameInfo").textContent = `frame ${state.frame + 1}/${FRAMES.length}${RIG ? " · " + RIG : ""}`;
+  const _wn = (typeof WP !== "undefined") ? Object.keys(WP).length : 0;
+  $("frameInfo").textContent = `frame ${state.frame + 1}/${FRAMES.length}${RIG ? " · " + RIG + ` (${_wn} wb)` : ""}`;
   if (+$("scrub").value !== state.frame) $("scrub").value = state.frame;
 }
 function tick(t) {
