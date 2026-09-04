@@ -27,7 +27,7 @@
 </head>
 <body>
 <header>
-  <h1>SFA anim player</h1>
+  <h1>SFA anim player</h1><span style='font-size:11px;color:#8b949e'>build-20260904-1257</span>
   <span id="meta">no animation loaded</span>
 </header>
 <div id="wrap">
@@ -317,7 +317,7 @@ function draw() {
   // joints
   const dot = (p, r, c) => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), r, 0, 7); ctx.fill(); };
   for (const n in P) dot(P[n], n === "pelvis" ? 5 : 2.5, n === "pelvis" ? "#f0883e" : "#58a6ff");
-  if ($("showW").checked) for (const n in WP) dot(WP[n], 2.5, "#00ff00");
+  if ($("showW").checked && RIG) for (const n in WP) dot(WP[n], 2.5, "#00ff00");
   if ($("showL").checked) {
     ctx.fillStyle = "#e6edf3"; ctx.font = "11px system-ui";
     ["pelvis", "hand_l", "hand_r", "head", "foot_l", "foot_r"].forEach(n => {
