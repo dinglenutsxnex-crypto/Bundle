@@ -286,7 +286,10 @@ function draw() {
     const byName = name => Object.values(rigOf().bones).find(b => b.name === name);
   const place = (name, parentPos) => {
     const entry = byName(name);
-    const off = (entry && entry.pos) || [0, 0, 0];
+    if (!entry) return;
+    const ov = null;
+    if (!entry.pos && !ov) return;
+    const off = (ov && ov.position) || entry.pos || [0, 0, 0];
     // v1: rigid offsets in parent space (fixed orientation); articulation needs anim curves
     WP[name] = [parentPos[0] + off[0], parentPos[1] + off[1], parentPos[2] + off[2]];
     (kids[name] || []).forEach(k => place(k, WP[name]));
