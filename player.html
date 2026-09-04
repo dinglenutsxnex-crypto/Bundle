@@ -33,8 +33,7 @@
 <div id="wrap">
   <div id="side">
     <label>Move CSV (name in animations_csv, or full URL, or local file below)</label>
-    <select id="move"></select>
-    <div id="moves"></div>
+    <select id="move" size="1"></select>
     <label>CSV base URL</label>
     <input id="base" type="text" value="https://raw.githubusercontent.com/dinglenutsxnex-crypto/Bundle/main/animations_csv" spellcheck="false">
     <div class="row">
@@ -77,9 +76,10 @@ const $ = id => document.getElementById(id);
 const cv = $("cv"), ctx = cv.getContext("2d");
 Object.keys(MOVE_GROUPS).sort().forEach(g => {
   const og = document.createElement("optgroup"); og.label = `${g} (${MOVE_GROUPS[g].length})`;
-  MOVE_GROUPS[g].forEach(m => { const o = document.createElement("option"); o.value = m; og.appendChild(o); });
-  $("moves").appendChild(og);
+  MOVE_GROUPS[g].forEach(m => { const o = document.createElement("option"); o.value = m; o.textContent = m; og.appendChild(o); });
+  $("move").appendChild(og);
 });
+$("move").value = "k_prc_kick_1";
 
 function msg(t) { $("msg").textContent = t || ""; }
 function parseCSV(text) {
@@ -361,7 +361,19 @@ const pb = document.createElement("button");
 pb.textContent = "▶/⏸"; pb.className = "ghost"; pb.style.cssText = "background:#21262d;color:#fff;border:0;border-radius:6px;padding:4px 10px;cursor:pointer;margin-right:8px";
 pb.onclick = toggle;
 $("hud").prepend(pb);
-Promise.all([loadRigs(), loadAnimMap()]).finally(() => { fit(); loadMove(); requestAnimationFrame(tick); });
+window.addEventListener("error", e => {
+  let d = document.getElementById("errbox");
+  if (!d) {
+    d = document.createElement("div");
+    d.id = "errbox";
+    d.style.cssText = "position:fixed;top:8px;right:8px;max-width:40%;background:#5a1d1d;color:#ffd7d7;border:1px solid #ff7b72;border-radius:8px;padding:8px 12px;font:12px monospace;z-index:99;white-space:pre-wrap;";
+    document.body.appendChild(d);
+  }
+  d.textContent += (e.message || e.error) + "\n";
+});
+fit();
+requestAnimationFrame(tick); // start render loop immediately; loads fill in async
+Promise.all([loadRigs(), loadAnimMap()]).finally(() => { loadMove(); });
 </script>
 </body>
 </html>
