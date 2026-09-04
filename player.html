@@ -107,7 +107,7 @@ async function loadMove() {
 }
 let ANIM2RIG = null;
 async function loadAnimMap() {
-  for (const u of ["./anim_weapon_map.json", "anim_weapon_map.json"]) {
+  for (const u of ["https://raw.githubusercontent.com/dinglenutsxnex-crypto/Bundle/main/anim_weapon_map.json", "./anim_weapon_map.json", "anim_weapon_map.json"]) {
     try {
       const r = await fetch(u);
       if (r.ok) { ANIM2RIG = await r.json(); break; }
@@ -192,7 +192,7 @@ let FULL_RIGS = null;
 async function rigData(name) {
   // full rig JSON, fetched lazily once
   if (FULL_RIGS) return FULL_RIGS[name] || null;
-  for (const u of ["./weapon_rigs.json", "weapon_rigs.json"]) {
+  for (const u of ["https://raw.githubusercontent.com/dinglenutsxnex-crypto/Bundle/main/weapon_rigs.json", "./weapon_rigs.json", "weapon_rigs.json"]) {
     try {
       const r = await fetch(u);
       if (r.ok) { FULL_RIGS = await r.json(); return FULL_RIGS[name] || null; }
@@ -204,7 +204,7 @@ async function loadRigs() {
   fillWeaponDropdown();
   {
     try {
-      const r = await fetch("./weapon_rigs.json");
+      const r = await fetch("https://raw.githubusercontent.com/dinglenutsxnex-crypto/Bundle/main/weapon_rigs.json").catch(() => fetch("./weapon_rigs.json"));
       if (r.ok) {
         FULL_RIGS = await r.json();
         RIGS = {};
