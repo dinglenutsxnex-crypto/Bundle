@@ -311,13 +311,13 @@ function draw() {
   if ($("showW").checked && RIG) {
     const rig = rigOf();
     if (rig) Object.values(rig.bones).forEach(b => {
-      if (b.parent && WP[b.parent] && WP[b.name]) line(WP[b.parent], WP[b.name], "rgba(255,123,114,.9)", 2);
+      if (b.parent && WP[b.parent] && WP[b.name]) line(WP[b.parent], WP[b.name], "rgba(0,255,0,.95)", 2);
     });
   }
   // joints
   const dot = (p, r, c) => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), r, 0, 7); ctx.fill(); };
   for (const n in P) dot(P[n], n === "pelvis" ? 5 : 2.5, n === "pelvis" ? "#f0883e" : "#58a6ff");
-  if ($("showW").checked) for (const n in WP) dot(WP[n], 2.5, "#ff7b72");
+  if ($("showW").checked) for (const n in WP) dot(WP[n], 2.5, "#00ff00");
   if ($("showL").checked) {
     ctx.fillStyle = "#e6edf3"; ctx.font = "11px system-ui";
     ["pelvis", "hand_l", "hand_r", "head", "foot_l", "foot_r"].forEach(n => {
@@ -378,7 +378,7 @@ window.addEventListener("error", e => {
   if (!d) {
     d = document.createElement("div");
     d.id = "errbox";
-    d.style.cssText = "position:fixed;top:8px;right:8px;max-width:40%;background:#5a1d1d;color:#ffd7d7;border:1px solid #ff7b72;border-radius:8px;padding:8px 12px;font:12px monospace;z-index:99;white-space:pre-wrap;";
+    d.style.cssText = "position:fixed;top:8px;right:8px;max-width:40%;background:#5a1d1d;color:#ffd7d7;border:1px solid #00ff00;border-radius:8px;padding:8px 12px;font:12px monospace;z-index:99;white-space:pre-wrap;";
     document.body.appendChild(d);
   }
   d.textContent += (e.message || e.error) + "\n";
