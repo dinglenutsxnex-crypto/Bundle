@@ -43,6 +43,7 @@
     </div>
     <label>Weapon rig (rigid attach to hands, v1)</label>
     <select id="weapon"><option value="">(none)</option></select>
+    <div id="wstat" style="font-size:11px;color:#8b949e;margin-top:4px;">weapon: none selected</div>
     <div class="row"><button id="rigFileBtn" class="ghost">Rigs JSON…</button>
     <input id="rigfile" type="file" accept=".json" hidden></div>
     <label>View</label>
@@ -109,27 +110,38 @@ async function loadAnimMap() {
   for (const u of ["./anim_weapon_map.json", "anim_weapon_map.json"]) {
     try {
       const r = await fetch(u);
-      if (r.ok) { ANIM2RIG = await r.json(); return; }
+      if (r.ok) { ANIM2RIG = await r.json(); break; }
     } catch (e) {}
   }
+  if (ANIM2RIG && FRAMES.length && !RIG) {
+    const cur = $("move").value;
+    if (cur) guessWeapon(cur);
+  }
 }
+function wstat(t) { const d = $("wstat"); if (d) d.textContent = "weapon: " + t; }
 function guessWeapon(moveName) {
+  if (window._pendingMove && window._pendingMove !== moveName) window._pendingMove = null;
   if (ANIM2RIG) {
     const hit = ANIM2RIG[moveName] || ANIM2RIG[moveName.toLowerCase()];
     if (hit) {
       const sel = $("weapon");
       const opt = [...sel.options].find(o => o.value === hit);
-      if (opt) { RIG = hit; sel.value = hit; return; }
+      if (opt) { RIG = hit; sel.value = hit; wstat("auto: " + hit); draw(); return; }
+      wstat("map hit " + hit + " not in rig list");
+    } else {
+      wstat("no map entry for " + moveName + " (unarmed/shared?)");
     }
     RIG = null; $("weapon").value = "";
+    draw();
     return;
   }
-  if (!RIGS) return;
+  if (!RIGS) { wstat("rig index not ready"); return; }
   const m = moveName.toLowerCase();
   const heroes = [...new Set(Object.keys(RIGS).map(w => w.split("-")[0]))];
   const hit = heroes.find(h => m.includes(h.replace("_", "")) || m.includes(h));
   const cands = Object.keys(RIGS).filter(w => !hit || w.split("-")[0] === hit);
-  if (cands.length) { RIG = cands[0]; $("weapon").value = RIG; }
+  if (cands.length) { RIG = cands[0]; $("weapon").value = RIG; wstat("heuristic: " + RIG); draw(); }
+  else { wstat("no rig for hero " + (hit || "?")); RIG = null; }
 }
 function setFrames(frames, name) {
   FRAMES = frames;
@@ -333,7 +345,7 @@ function tick(t) {
 $("load").onclick = loadMove;
 if ($("move").tagName === "INPUT") $("move").addEventListener("keydown", e => { if (e.key === "Enter") loadMove(); });
 $("move").addEventListener("change", loadMove);
-$("weapon").onchange = e => { RIG = e.target.value || null; draw(); };
+$("weapon").onchange = e => { RIG = e.target.value || null; wstat(RIG ? "manual: " + RIG : "none selected"); draw(); };
 $("view").onchange = e => { state.view = e.target.value; draw(); };
 $("spd").oninput = e => { state.speed = +e.target.value; $("spdV").textContent = state.speed.toFixed(2) + "x"; };
 $("showW").onchange = draw; $("showL").onchange = draw;
